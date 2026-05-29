@@ -1,7 +1,9 @@
 import os
-import io
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from datetime import timedelta
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -10,30 +12,158 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error
 
-from Healthy_Prediction import (
-    load_records_from_xml,
-    load_workouts_from_xml,
-    compute_sleep_scores,
-    compute_exercise_metrics,
-    correlate_sleep_vs_exercise,
-    map_workout_activity,
-)
+from Healthy_Prediction import map_workout_activity
 from ml_healthy_detection_exercise_suggestion import prepare_features
 
 st.set_page_config(page_title="AI 運動負荷與智慧推薦系統", page_icon="⌚", layout="centered")
 st.title("⌚ AI 運動生理負荷預測與智慧推薦系統")
 
-# ── 解析 Apple Health export.zip ────────────────────────────────────────────
+# ── 串流解析 Apple Health export.xml ────────────────────────────────────────
+#
+# 傳統做法：把所有 HR + Sleep records 讀進 DataFrame（1.8GB XML → ~500MB RAM）
+# 串流做法：iterparse 逐筆掃描，只維護 daily bucket（字典），每讀完一筆立刻 elem.clear()
+#           掃完後記憶體只剩 ~365 個日期的彙總數字，降低約 100 倍記憶體用量
+#
+# daily bucket 結構：
+#   sleep_buckets[date]   = total_sleep_hours (float)
+#   hr_buckets[date]      = {'ex_sum': 0, 'ex_cnt': 0, 'max': 0}
+#                             ex = exercise samples (HR ≥ 90 BPM)
+#   workout_buckets[date] = {'types': set(), 'minutes': 0, 'distance': 0, 'energy': 0}
+
+_EXERCISE_HR_THRESHOLD = 90  # BPM
+
+
+def _stream_parse_xml(xml_path: str):
+    """單次 iterparse 掃描，回傳三個 daily bucket 字典。"""
+    sleep_buckets = defaultdict(float)
+    hr_buckets = defaultdict(lambda: {"ex_sum": 0.0, "ex_cnt": 0, "max": 0.0})
+    workout_buckets = defaultdict(lambda: {"types": set(), "minutes": 0.0, "distance": 0.0, "energy": 0.0})
+
+    for _event, elem in ET.iterparse(xml_path, events=("end",)):
+        tag = elem.tag
+
+        if tag.endswith("Record"):
+            rtype = elem.get("type", "")
+
+            if rtype == "HKQuantityTypeIdentifierHeartRate":
+                try:
+                    val = float(elem.get("value", "nan"))
+                    date = pd.to_datetime(elem.get("startDate"), utc=True).date()
+                    bucket = hr_buckets[date]
+                    if val > bucket["max"]:
+                        bucket["max"] = val
+                    if val >= _EXERCISE_HR_THRESHOLD:
+                        bucket["ex_sum"] += val
+                        bucket["ex_cnt"] += 1
+                except Exception:
+                    pass
+
+            elif rtype == "HKCategoryTypeIdentifierSleepAnalysis":
+                try:
+                    start = pd.to_datetime(elem.get("startDate"), utc=True)
+                    end = pd.to_datetime(elem.get("endDate"), utc=True)
+                    duration_hr = (end - start).total_seconds() / 3600
+                    # endDate.date() 代表這段睡眠所屬的那天（與 compute_sleep_scores 一致）
+                    sleep_buckets[end.date()] += duration_hr
+                except Exception:
+                    pass
+
+        elif tag.endswith("Workout"):
+            try:
+                start = pd.to_datetime(elem.get("startDate"), utc=True)
+                end = pd.to_datetime(elem.get("endDate"), utc=True)
+                date = start.date()
+                activity = map_workout_activity(elem.get("workoutActivityType") or elem.get("activityType") or "")
+                minutes = (end - start).total_seconds() / 60
+                distance = float(elem.get("totalDistance") or 0)
+                energy = float(elem.get("totalEnergyBurned") or 0)
+                b = workout_buckets[date]
+                if activity:
+                    b["types"].add(activity)
+                b["minutes"] += minutes
+                b["distance"] += distance
+                b["energy"] += energy
+            except Exception:
+                pass
+
+        elem.clear()  # 立刻釋放 XML node，不讓記憶體累積
+
+    return sleep_buckets, hr_buckets, workout_buckets
+
+
+def _buckets_to_df(sleep_buckets, hr_buckets, workout_buckets) -> pd.DataFrame:
+    """將三個 daily bucket 合併成模型訓練用的 DataFrame。"""
+    # sleep: shift +1 天，讓前一晚睡眠對應隔天運動（與 correlate_sleep_vs_exercise 一致）
+    sleep_shifted = {date + timedelta(days=1): hours for date, hours in sleep_buckets.items()}
+
+    # HR metrics
+    hr_rows = []
+    for date, b in hr_buckets.items():
+        mean_ex = b["ex_sum"] / b["ex_cnt"] if b["ex_cnt"] > 0 else float("nan")
+        hr_rows.append({"date": date, "mean_exercise_hr": mean_ex, "max_hr": b["max"]})
+    hr_df = pd.DataFrame(hr_rows).set_index("date") if hr_rows else pd.DataFrame(columns=["mean_exercise_hr", "max_hr"])
+
+    # 只保留有運動心率紀錄的日期
+    hr_df = hr_df.dropna(subset=["mean_exercise_hr"])
+    if hr_df.empty:
+        raise ValueError("找不到足夠的運動心率紀錄（HR ≥ 90 BPM）。請確認 Apple Watch 有記錄運動數據。")
+
+    # sleep Series（對齊 HR 日期）
+    sleep_series = pd.Series(sleep_shifted, name="sleep_hours")
+    sleep_series.index = pd.to_datetime(list(sleep_series.index))
+    hr_df.index = pd.to_datetime(hr_df.index)
+
+    merged = hr_df.join(sleep_series, how="inner")
+    merged = merged.dropna(subset=["sleep_hours"])
+
+    if len(merged) == 0:
+        raise ValueError("睡眠與運動紀錄沒有重疊的日期，請確認 Apple Watch 有同時記錄睡眠與運動。")
+
+    # workout 欄位
+    w_rows = []
+    for date, b in workout_buckets.items():
+        w_rows.append({
+            "date": pd.Timestamp(date),
+            "workout_types": ";".join(sorted(b["types"])),
+            "num_workouts": len(b["types"]),
+            "total_workout_minutes": b["minutes"],
+            "total_workout_distance": b["distance"],
+            "total_workout_energy": b["energy"],
+            "has_running": int("Running" in b["types"]),
+            "has_walking": int("Walking" in b["types"]),
+            "has_hiit": int("HIIT" in b["types"]),
+        })
+    workout_df = pd.DataFrame(w_rows).set_index("date") if w_rows else pd.DataFrame()
+
+    if not workout_df.empty:
+        merged = merged.join(workout_df, how="left")
+
+    for col in ["workout_types"]:
+        if col not in merged.columns:
+            merged[col] = ""
+        merged[col] = merged[col].fillna("")
+    for col in ["num_workouts", "has_running", "has_walking", "has_hiit"]:
+        if col not in merged.columns:
+            merged[col] = 0
+        merged[col] = merged[col].fillna(0).astype(int)
+    for col in ["total_workout_minutes", "total_workout_distance", "total_workout_energy"]:
+        if col not in merged.columns:
+            merged[col] = 0.0
+        merged[col] = merged[col].fillna(0.0)
+
+    merged = merged.rename_axis("date").reset_index()
+    merged["date"] = pd.to_datetime(merged["date"])
+    return merged
+
 
 def parse_zip_to_df(uploaded_file) -> pd.DataFrame:
-    """上傳的 export.zip → 解析成訓練用 DataFrame（與 Healthy_Prediction.main 邏輯相同）"""
+    """上傳的 export.zip → 串流解析 → 訓練用 DataFrame（低記憶體）"""
     with tempfile.TemporaryDirectory() as tmpdir:
         zip_bytes = uploaded_file.read()
         zip_path = os.path.join(tmpdir, "export.zip")
         with open(zip_path, "wb") as f:
             f.write(zip_bytes)
 
-        # 解壓找 export.xml
         xml_path = None
         with zipfile.ZipFile(zip_path, "r") as z:
             for member in z.namelist():
@@ -45,19 +175,10 @@ def parse_zip_to_df(uploaded_file) -> pd.DataFrame:
         if xml_path is None or not os.path.exists(xml_path):
             raise FileNotFoundError("在 zip 中找不到 export.xml，請確認是從 Apple Health 匯出的原始檔案。")
 
-        df = load_records_from_xml(xml_path)
-        if df.empty:
-            raise ValueError("解析後沒有任何紀錄，請確認 export.xml 內容。")
+        sleep_buckets, hr_buckets, workout_buckets = _stream_parse_xml(xml_path)
+        return _buckets_to_df(sleep_buckets, hr_buckets, workout_buckets)
 
-        hr = df[df["type"] == "HKQuantityTypeIdentifierHeartRate"].copy()
-        sleep = df[df["type"] == "HKCategoryTypeIdentifierSleepAnalysis"].copy()
-
-        sleep_scores = compute_sleep_scores(sleep)
-        exercise_metrics = compute_exercise_metrics(hr)
-        corr = correlate_sleep_vs_exercise(sleep_scores, exercise_metrics, sleep_shift_days=1)
-
-        if corr["n"] == 0:
-            raise ValueError("資料中找不到足夠的睡眠與運動心率重疊日期，無法訓練模型（至少需要 10 天以上的運動紀錄）。")
+    # tmpdir 離開 with block 時自動刪除，export.xml 也一併清除
 
         wdf = load_workouts_from_xml(xml_path)
         merged = corr["merged"].copy()
