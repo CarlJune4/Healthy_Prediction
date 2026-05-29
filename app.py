@@ -15,6 +15,8 @@ import joblib
 st.set_page_config(page_title="AI 運動負荷與智慧推薦系統", page_icon="⌚", layout="centered")
 st.title("⌚ AI 運動生理負荷預測與智慧推薦系統")
 
+st.info("⏳ **首次開啟或長時間未使用時，伺服器需要約 30～60 秒喚醒，頁面完成載入後即可正常使用。**")
+
 # ── workout 類型對應表（內聯，避免載入整個 Healthy_Prediction 模組）───────────
 
 _WORKOUT_MAP = {
