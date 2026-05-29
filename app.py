@@ -1,5 +1,5 @@
-import os
-import tempfile
+import os  # still needed for MODEL_PATH
+import io
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -48,12 +48,13 @@ def _map_workout(code: str) -> str:
 _EXERCISE_HR_THRESHOLD = 90
 
 
-def _stream_parse_xml(xml_path: str):
+def _stream_parse_xml(xml_source):
+    """xml_source 可以是檔案路徑（str）或 file-like object，支援直接從 zip 串流讀取。"""
     sleep_buckets = defaultdict(float)
     hr_buckets = defaultdict(lambda: {"ex_sum": 0.0, "ex_cnt": 0, "max": 0.0})
     workout_buckets = defaultdict(lambda: {"types": set(), "minutes": 0.0, "distance": 0.0, "energy": 0.0})
 
-    for _event, elem in ET.iterparse(xml_path, events=("end",)):
+    for _event, elem in ET.iterparse(xml_source, events=("end",)):
         tag = elem.tag
 
         if tag.endswith("Record"):
@@ -147,24 +148,27 @@ def _buckets_to_df(sleep_buckets, hr_buckets, workout_buckets) -> pd.DataFrame:
 
 
 def parse_zip_to_df(uploaded_file) -> pd.DataFrame:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "export.zip")
-        with open(zip_path, "wb") as f:
-            f.write(uploaded_file.read())
+    # io.BytesIO 讓 zipfile 直接從記憶體讀取，不需要寫到磁碟
+    # z.open(member) 回傳 file-like object，ET.iterparse 直接串流讀取
+    # → 完全跳過「解壓 1.8GB XML 到磁碟」這一步，節省大量時間與磁碟 IO
+    zip_bytes = io.BytesIO(uploaded_file.read())
 
-        xml_path = None
-        with zipfile.ZipFile(zip_path, "r") as z:
-            for member in z.namelist():
-                if member.endswith("export.xml"):
-                    z.extract(member, tmpdir)
-                    xml_path = os.path.join(tmpdir, member)
-                    break
+    xml_member = None
+    with zipfile.ZipFile(zip_bytes, "r") as z:
+        for member in z.namelist():
+            if member.endswith("export.xml"):
+                xml_member = member
+                break
 
-        if not xml_path or not os.path.exists(xml_path):
-            raise FileNotFoundError("在 zip 中找不到 export.xml，請確認是從 Apple Health 匯出的原始檔案。")
+    if not xml_member:
+        raise FileNotFoundError("在 zip 中找不到 export.xml，請確認是從 Apple Health 匯出的原始檔案。")
 
-        sleep_buckets, hr_buckets, workout_buckets = _stream_parse_xml(xml_path)
-        return _buckets_to_df(sleep_buckets, hr_buckets, workout_buckets)
+    zip_bytes.seek(0)
+    with zipfile.ZipFile(zip_bytes, "r") as z:
+        with z.open(xml_member) as xml_stream:
+            sleep_buckets, hr_buckets, workout_buckets = _stream_parse_xml(xml_stream)
+
+    return _buckets_to_df(sleep_buckets, hr_buckets, workout_buckets)
 
 
 def train_personal_model(df: pd.DataFrame):
