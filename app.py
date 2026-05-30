@@ -205,26 +205,27 @@ def train_personal_model(df: pd.DataFrame):
 
 # ── 預測 UI ────────────────────────────────────────────────────────────────
 
-def prediction_ui(model, model_label: str):
+def prediction_ui(model, model_label: str, key_prefix: str = "default"):
+    # key_prefix 確保 Tab 1 / Tab 2 的 widget 有不同 element ID，避免 StreamlitDuplicateElementId
     st.markdown(f"**使用模型：{model_label}**")
     st.header("📥 輸入今日身體狀態與計畫")
 
-    sleep_yesterday = st.slider("昨晚睡眠時數 (小時)", min_value=0.0, max_value=24.0, value=8.0, step=0.5)
-    sleep_3d_avg = st.slider("過去 3 天平均睡眠 (小時)", min_value=0.0, max_value=24.0, value=8.0, step=0.5)
-    last_hr_mean = st.number_input("上一次運動的平均心率 (BPM)", min_value=60, max_value=200, value=105)
-    last_hr_max = st.number_input("上一次運動的最大心率 (BPM)", min_value=80, max_value=220, value=135)
-    workout_type = st.selectbox("預計今日運動項目", ["重量訓練 (Strength Training)", "戶外/室內健走 (Walking)", "跑步 (Running)", "其他常規運動"])
-    planned_duration = st.slider("預計運動時間 (分鐘)", min_value=10, max_value=240, value=60, step=5)
+    sleep_yesterday = st.slider("昨晚睡眠時數 (小時)", min_value=0.0, max_value=24.0, value=8.0, step=0.5, key=f"{key_prefix}_sleep_yesterday")
+    sleep_3d_avg = st.slider("過去 3 天平均睡眠 (小時)", min_value=0.0, max_value=24.0, value=8.0, step=0.5, key=f"{key_prefix}_sleep_3d_avg")
+    last_hr_mean = st.number_input("上一次運動的平均心率 (BPM)", min_value=60, max_value=200, value=105, key=f"{key_prefix}_hr_mean")
+    last_hr_max = st.number_input("上一次運動的最大心率 (BPM)", min_value=80, max_value=220, value=135, key=f"{key_prefix}_hr_max")
+    workout_type = st.selectbox("預計今日運動項目", ["重量訓練 (Strength Training)", "戶外/室內健走 (Walking)", "跑步 (Running)", "其他常規運動"], key=f"{key_prefix}_workout_type")
+    planned_duration = st.slider("預計運動時間 (分鐘)", min_value=10, max_value=240, value=60, step=5, key=f"{key_prefix}_duration")
 
     planned_distance = 0.0
     if workout_type in ["戶外/室內健走 (Walking)", "跑步 (Running)"]:
-        planned_distance = st.number_input("預計運動距離 (公里)", min_value=0.0, max_value=100.0, value=5.0, step=0.5, format="%.1f")
+        planned_distance = st.number_input("預計運動距離 (公里)", min_value=0.0, max_value=100.0, value=5.0, step=0.5, format="%.1f", key=f"{key_prefix}_distance")
 
-    planned_intensity = st.selectbox("預計訓練強度", ["低強度", "中等強度", "高強度"])
+    planned_intensity = st.selectbox("預計訓練強度", ["低強度", "中等強度", "高強度"], key=f"{key_prefix}_intensity")
 
     run_mode = None
     if "Running" in workout_type:
-        run_mode = st.selectbox("跑步訓練類型", ["一般跑步", "輕鬆跑", "長距離", "間歇"])
+        run_mode = st.selectbox("跑步訓練類型", ["一般跑步", "輕鬆跑", "長距離", "間歇"], key=f"{key_prefix}_run_mode")
 
     is_strength = 1 if "Strength" in workout_type else 0
     is_walking = 1 if "Walking" in workout_type else 0
@@ -239,7 +240,7 @@ def prediction_ui(model, model_label: str):
         is_running, is_walking, has_hiit,
     ]])
 
-    if st.button("🚀 開始智慧身體負荷評估"):
+    if st.button("🚀 開始智慧身體負荷評估", key=f"{key_prefix}_submit"):
         predicted_hr = model.predict(input_data)[0]
         st.subheader("📊 AI 預測與評估結果")
         st.metric(label="預估今日運動平均心率", value=f"{predicted_hr:.1f} BPM")
@@ -290,7 +291,7 @@ with tab1:
 
     try:
         default_model = load_default_model()
-        prediction_ui(default_model, "示範模型（作者數據）")
+        prediction_ui(default_model, "示範模型（作者數據）", key_prefix="tab1")
     except Exception as exc:
         st.error(f"無法載入示範模型：{exc}")
 
@@ -328,4 +329,4 @@ with tab2:
             if r2 < 0.3:
                 st.warning("⚠️ 模型解釋力較低（R² < 0.3），預測結果僅供參考。")
             st.divider()
-            prediction_ui(st.session_state["personal_model"], "您的個人化模型")
+            prediction_ui(st.session_state["personal_model"], "您的個人化模型", key_prefix="tab2")
