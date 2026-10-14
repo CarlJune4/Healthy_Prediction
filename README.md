@@ -1,5 +1,7 @@
 # Healthy_Prediction
 
+**Live demo:** https://healthyprediction.streamlit.app/ (Chinese UI; the first load can take 30–60 seconds while the free server wakes up)
+
 Predict how hard today's workout will feel — as average exercise heart rate — from your recent sleep and training history, using your own Apple Health data.
 
 The project has two parts:
